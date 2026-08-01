@@ -1,6 +1,10 @@
 #include <glob.h>
 #include <termios.h>
 #include <unistd.h>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -48,26 +52,39 @@ private:
 
 class KeyboardHandler {
 public:
-  KeyboardHandler() : paused_(false), active_(false) {
-    if (isatty(STDIN_FILENO)) {
-      tcgetattr(STDIN_FILENO, &original_termios_);
-      struct termios raw = original_termios_;
-      raw.c_lflag &= ~(ICANON | ECHO);
-      raw.c_cc[VMIN] = 0;
-      raw.c_cc[VTIME] = 0;
-      tcsetattr(STDIN_FILENO, TCSANOW, &raw);
-      active_ = true;
+  KeyboardHandler() : paused_(false) {
+    if (!isatty(STDIN_FILENO)) {
+      return;
+    }
+
+    struct termios original;
+    tcgetattr(STDIN_FILENO, &original);
+    struct termios raw = original;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+
+    // Remember the original terminal settings
+    saved_termios_ = original;
+    active_.store(true);
+
+    std::atexit(&KeyboardHandler::cleanup);
+    for (const int signum : {SIGINT, SIGTERM, SIGQUIT, SIGSEGV, SIGABRT}) {
+      install_handler(signum);
     }
   }
 
-  ~KeyboardHandler() {
-    if (active_) {
-      tcsetattr(STDIN_FILENO, TCSANOW, &original_termios_);
+  ~KeyboardHandler() { KeyboardHandler::cleanup(); }
+
+  static void cleanup() {
+    if (active_.exchange(false)) {
+      tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios_);
     }
   }
 
   void update() {
-    if (!active_) return;
+    if (!active_.load()) return;
     char c;
     while (read(STDIN_FILENO, &c, 1) > 0) {
       if (c == ' ') {
@@ -84,10 +101,42 @@ public:
   bool is_paused() const { return paused_; }
 
 private:
+  static void install_handler(int signum) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = &KeyboardHandler::signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(signum, &sa, &prev_actions_[signum]);
+  }
+
+  static void signal_handler(int signum, siginfo_t* info, void* context) {
+    KeyboardHandler::cleanup();
+
+    const struct sigaction& prev = prev_actions_[signum];
+    if (prev.sa_flags & SA_SIGINFO) {
+      if (prev.sa_sigaction) {
+        prev.sa_sigaction(signum, info, context);
+      }
+    } else if (prev.sa_handler == SIG_IGN) {
+    } else if (prev.sa_handler && prev.sa_handler != SIG_DFL) {
+      prev.sa_handler(signum);
+    } else {
+      signal(signum, SIG_DFL);
+      raise(signum);
+    }
+  }
+
   bool paused_;
-  bool active_;
-  struct termios original_termios_;
+
+  static std::atomic_bool active_;
+  static struct termios saved_termios_;
+  static struct sigaction prev_actions_[NSIG];
 };
+
+std::atomic_bool KeyboardHandler::active_{false};
+struct termios KeyboardHandler::saved_termios_;
+struct sigaction KeyboardHandler::prev_actions_[NSIG];
 
 int main(int argc, char** argv) {
   if (argc < 2) {
@@ -360,7 +409,7 @@ int main(int argc, char** argv) {
       speed_counter.update(msg_time / 1e9);
 
       const auto t0 = std::chrono::high_resolution_clock::now();
-      while (glim->needs_wait()) {
+      while (glim->needs_wait() && rclcpp::ok()) {
         rclcpp::spin_some(glim);
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         spdlog::debug("throttling (waiting for odometry estimation)");
@@ -390,12 +439,14 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (!auto_quit) {
+  if (!auto_quit && rclcpp::ok()) {
     rclcpp::spin(glim);
   }
 
+  keyboard.cleanup();  // Explicitly restore terminal settings to avoid issues if the program is interrupted before exiting normally.
   glim->wait(auto_quit);
   glim->save(dump_path);
+  glim.reset();
 
   return 0;
 }
