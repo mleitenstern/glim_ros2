@@ -5,19 +5,16 @@
 
 #include <spdlog/spdlog.h>
 
-#include <gtsam/geometry/Pose3.h>
-#include <gtsam/nonlinear/PriorFactor.h>
 #include <gtsam_points/ann/kdtree2.hpp>
 #include <gtsam_points/ann/kdtreex.hpp>
 #include <gtsam_points/types/point_cloud.hpp>
 #include <gtsam_points/features/normal_estimation.hpp>
 #include <gtsam_points/features/fpfh_estimation.hpp>
-#include <gtsam_points/factors/integrated_gicp_factor.hpp>
 #include <gtsam_points/registration/ransac.hpp>
 #include <gtsam_points/registration/graduated_non_convexity.hpp>
-#include <gtsam_points/optimizers/levenberg_marquardt_ext.hpp>
 
 #include <glim/util/convert_to_string.hpp>
+#include <glim_ros/lidar_calibration/registration.hpp>
 
 #include <glk/pointcloud_buffer.hpp>
 #include <glk/primitives/primitives.hpp>
@@ -25,10 +22,6 @@
 #include <guik/model_control.hpp>
 #include <guik/progress_modal.hpp>
 #include <guik/viewer/light_viewer.hpp>
-
-#ifdef GTSAM_USE_TBB
-#include <tbb/task_arena.h>
-#endif
 
 namespace glim {
 
@@ -53,10 +46,6 @@ AlignModal::AlignModal(const std::shared_ptr<spdlog::logger>& logger, int num_th
   canvas.reset(new guik::GLCanvas(Eigen::Vector2i(768, 576)));
   progress_modal.reset(new guik::ProgressModal("align_modal_progress"));
   model_control.reset(new guik::ModelControl("align_model_control"));
-
-#ifdef GTSAM_USE_TBB
-  tbb_task_arena = std::make_shared<tbb::task_arena>(1);
-#endif
 }
 
 AlignModal::~AlignModal() {}
@@ -223,6 +212,7 @@ std::optional<AlignResult> AlignModal::run() {
       AlignResult res;
       res.T_target_source = Eigen::Isometry3d(model_control->model_matrix().cast<double>());
       res.error = last_error;
+      res.rotation_only = rotation_only;
       result = res;
 
       ImGui::CloseCurrentPopup();
@@ -373,62 +363,25 @@ std::shared_ptr<Eigen::Isometry3d> AlignModal::align_global(guik::ProgressInterf
 
 std::shared_ptr<Eigen::Isometry3d> AlignModal::align(guik::ProgressInterface& progress) {
   progress.set_title("Fine registration");
-  const int num_iterations = 30;
-  progress.set_maximum(num_iterations);
-
-  progress.set_text("Creating graph");
-  const Eigen::Isometry3d init_T(model_control->model_matrix().cast<double>());
-
-  gtsam::NonlinearFactorGraph graph;
-  graph.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(0, gtsam::Pose3::Identity(), gtsam::noiseModel::Isotropic::Precision(6, 1e6));
-
-  if (rotation_only) {
-    // Anchor the translation of T_target_source to the initial guess (rotation stays free)
-    gtsam::Vector6 sigmas;
-    sigmas << 1e6, 1e6, 1e6, 1e-6, 1e-6, 1e-6;
-    graph.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(1, gtsam::Pose3(init_T.matrix()), gtsam::noiseModel::Diagonal::Sigmas(sigmas));
-  }
-
-  auto factor = gtsam::make_shared<gtsam_points::IntegratedGICPFactor>(0, 1, target, source);
-  factor->set_num_threads(num_threads);
-  factor->set_max_correspondence_distance(max_correspondence_distance);
-  graph.add(factor);
-
-  gtsam::Values values;
-  values.insert(0, gtsam::Pose3::Identity());
-  values.insert(1, gtsam::Pose3(init_T.matrix()));
-
   progress.set_text("Optimizing");
-  double final_error = -1.0;
 
-  gtsam_points::LevenbergMarquardtExtParams lm_params;
-  lm_params.setMaxIterations(num_iterations);
-  lm_params.callback = [&](const gtsam_points::LevenbergMarquardtOptimizationStatus& status, const gtsam::Values& values) {
+  FineRegistrationParams params;
+  params.max_correspondence_distance = max_correspondence_distance;
+  params.max_iterations = 30;
+  params.rotation_only = rotation_only;
+  params.num_threads = num_threads;
+  progress.set_maximum(params.max_iterations);
+
+  const Eigen::Isometry3d init_T(model_control->model_matrix().cast<double>());
+  const auto result = fine_registration(target, nullptr, source, Eigen::Isometry3d::Identity(), init_T, params, [&](int iteration, double error) {
     progress.increment();
-    progress.set_text(fmt::format("Optimizing iter:{} error:{:.3f}", status.iterations, status.error));
-    final_error = status.error;
-  };
-
-  gtsam_points::LevenbergMarquardtOptimizerExt optimizer(graph, values, lm_params);
-
-#ifdef GTSAM_USE_TBB
-  auto arena = static_cast<tbb::task_arena*>(tbb_task_arena.get());
-  arena->execute([&] {
-#endif
-    values = optimizer.optimize();
-#ifdef GTSAM_USE_TBB
+    progress.set_text(fmt::format("Optimizing iter:{} error:{:.3f}", iteration, error));
   });
-#endif
 
-  last_error = final_error;
+  last_error = result.error;
+  logger->info("fine registration: error={:.3f} inlier_fraction={:.3f}", result.error, result.inlier_fraction);
 
-  const gtsam::Pose3 estimated_pose = values.at<gtsam::Pose3>(0).inverse() * values.at<gtsam::Pose3>(1);
-  Eigen::Isometry3d estimated(estimated_pose.matrix());
-  if (rotation_only) {
-    estimated.translation() = init_T.translation();
-  }
-
-  return std::make_shared<Eigen::Isometry3d>(estimated);
+  return std::make_shared<Eigen::Isometry3d>(result.T_world_source);
 }
 
 void AlignModal::draw_canvas() {

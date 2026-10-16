@@ -30,6 +30,7 @@ struct AlignResult {
 
   Eigen::Isometry3d T_target_source;  ///< Estimated source pose in the target frame
   double error;                       ///< Final fine registration error (negative if fine registration was not run)
+  bool rotation_only;                 ///< Whether the translation was fixed to the given values
 };
 
 /// @brief ImGui modal for aligning a source point cloud to a target point cloud.
@@ -105,8 +106,6 @@ private:
 
   gtsam_points::NearestNeighborSearch::Ptr target_fpfh_tree;
   gtsam_points::NearestNeighborSearch::Ptr source_fpfh_tree;
-
-  std::shared_ptr<void> tbb_task_arena;
 
   std::shared_ptr<spdlog::logger> logger;
 };

@@ -110,8 +110,11 @@ if(BUILD_WITH_VIEWER)
   ament_auto_add_executable(lidar_calibration
     src/lidar_calibration.cpp
     src/glim_ros/lidar_calibration/align_modal.cpp
+    src/glim_ros/lidar_calibration/batch_calibration.cpp
+    src/glim_ros/lidar_calibration/calibration_bag.cpp
     src/glim_ros/lidar_calibration/calibration_viewer.cpp
     src/glim_ros/lidar_calibration/pcd_loader.cpp
+    src/glim_ros/lidar_calibration/registration.cpp
   )
   target_include_directories(lidar_calibration PRIVATE
     include
